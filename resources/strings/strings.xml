@@ -4,5 +4,8 @@
     <string id="Waiting">Waiting for HRV data</string>
     <string id="Calibrating">Calibration...</string>
     <string id="TakeSeat">Take seat &amp; rest!</string>
+    <string id="BreatheIn">Breathe in</string>
+    <string id="BreatheOut">Breathe out</string>
+    <string id="BreatheNormal">Breathe normally</string>
     <string id="Alert">Lie hypothesis!</string>
 </resources>

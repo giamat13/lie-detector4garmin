@@ -11,12 +11,17 @@ class LieDetectorView extends WatchUi.View {
     // Tunables
     private const RR_MIN_MS = 300;
     private const RR_MAX_MS = 2000;
+    private const RR_JUMP = 0.25;       // reject RR >25% away from the window mean (artifact/ectopic)
     private const WINDOW = 12;          // RR intervals per RMSSD window
     private const MIN_RR_FOR_RMSSD = 6; // need at least this many to compute
     private const CALIB_SECONDS = 60;
+    private const GUIDE_SECONDS = 30;   // paced-breathing phase (not used for the baseline)
+    private const BREATH_CYCLE_MS = 10000; // 6 breaths/min: 5 s in, 5 s out
     private const MIN_BASELINE_SAMPLES = 5;
+    private const MIN_STD = 0.1;        // floor for std of ln(RMSSD) (about 10%)
     private const GRAPH_POINTS = 60;
     private const THRESHOLD = 2.5;
+    private const CONFIRM_SAMPLES = 2;  // consecutive samples beyond threshold needed
     private const Z_RANGE = 4.0;        // graph shows -Z_RANGE..+Z_RANGE
     private const BANNER_MS = 5000;
 
@@ -26,11 +31,13 @@ class LieDetectorView extends WatchUi.View {
 
     private var _state as Number = 0;
     private var _timer as Timer.Timer?;
+    private var _animTimer as Timer.Timer?;
     private var _listening as Boolean = false;
+    private var _calibStartMs as Number = 0;
 
     private var _rr as Array<Number> = [] as Array<Number>;
 
-    // Baseline (Welford running mean / variance of RMSSD)
+    // Baseline (Welford running mean / variance of ln(RMSSD))
     private var _calibElapsed as Number = 0;
     private var _n as Number = 0;
     private var _mean as Float = 0.0;
@@ -40,6 +47,7 @@ class LieDetectorView extends WatchUi.View {
     // Graph data
     private var _zs as Array<Float> = [] as Array<Float>;
     private var _spikes as Array<Boolean> = [] as Array<Boolean>;
+    private var _streak as Number = 0;
     private var _lastSpikeMs as Number = -1;
     private var _blink as Boolean = false;
 
@@ -60,6 +68,9 @@ class LieDetectorView extends WatchUi.View {
         var t = new Timer.Timer();
         t.start(method(:onTick), 1000, true);
         _timer = t;
+        var a = new Timer.Timer();
+        a.start(method(:onAnim), 100, true);
+        _animTimer = a;
     }
 
     function onHide() as Void {
@@ -72,6 +83,18 @@ class LieDetectorView extends WatchUi.View {
             t.stop();
             _timer = null;
         }
+        var a = _animTimer;
+        if (a != null) {
+            a.stop();
+            _animTimer = null;
+        }
+    }
+
+    // Smooth breathing-circle animation, only while calibrating.
+    function onAnim() as Void {
+        if (_state == ST_CALIBRATING) {
+            WatchUi.requestUpdate();
+        }
     }
 
     // Sensor callback: collect valid beat-to-beat intervals.
@@ -83,15 +106,23 @@ class LieDetectorView extends WatchUi.View {
         var list = hr.heartBeatIntervals;
         for (var i = 0; i < list.size(); i++) {
             var v = list[i];
-            if (v >= RR_MIN_MS && v <= RR_MAX_MS) {
-                _rr.add(v);
-                if (_rr.size() > WINDOW) {
-                    _rr = _rr.slice(1, null);
+            if (v < RR_MIN_MS || v > RR_MAX_MS) {
+                continue;
+            }
+            if (_rr.size() >= 3) {
+                var m = windowMean();
+                if ((v - m).abs() > RR_JUMP * m) {
+                    continue; // artifact / ectopic beat
                 }
-                if (_state == ST_WAITING) {
-                    _state = ST_CALIBRATING;
-                    _calibElapsed = 0;
-                }
+            }
+            _rr.add(v);
+            if (_rr.size() > WINDOW) {
+                _rr = _rr.slice(1, null);
+            }
+            if (_state == ST_WAITING) {
+                _state = ST_CALIBRATING;
+                _calibElapsed = 0;
+                _calibStartMs = System.getTimer();
             }
         }
     }
@@ -102,29 +133,30 @@ class LieDetectorView extends WatchUi.View {
 
         if (_state == ST_CALIBRATING) {
             _calibElapsed++;
-            var r = rmssd();
-            if (r != null && _rr.size() >= WINDOW) {
-                // Welford update
-                _n++;
-                var d = r - _mean;
-                _mean += d / _n;
-                _m2 += d * (r - _mean);
+            // The baseline is taken only after the paced-breathing phase, while
+            // breathing normally (paced breathing inflates RMSSD).
+            if (_calibElapsed > GUIDE_SECONDS && _rr.size() >= WINDOW) {
+                var r = rmssd();
+                if (r != null && r > 0) {
+                    var x = Math.ln(r).toFloat();
+                    _n++;
+                    var d = x - _mean;
+                    _mean += d / _n;
+                    _m2 += d * (x - _mean);
+                }
             }
             if (_calibElapsed >= CALIB_SECONDS && _n >= MIN_BASELINE_SAMPLES) {
                 var sd = Math.sqrt(_m2 / (_n - 1)).toFloat();
-                // Floor avoids absurd z-scores from a very steady baseline.
-                var floorStd = _mean * 0.1;
-                if (floorStd < 1.0) {
-                    floorStd = 1.0;
-                }
-                _std = (sd > floorStd) ? sd : floorStd;
+                _std = (sd > MIN_STD) ? sd : MIN_STD;
                 _state = ST_RUNNING;
             }
         } else if (_state == ST_RUNNING) {
             var r = rmssd();
-            if (r != null) {
-                var z = (r - _mean) / _std;
-                var spike = (z > THRESHOLD || z < -THRESHOLD);
+            if (r != null && r > 0) {
+                var z = (Math.ln(r).toFloat() - _mean) / _std;
+                var beyond = (z > THRESHOLD || z < -THRESHOLD);
+                _streak = beyond ? _streak + 1 : 0;
+                var spike = (_streak >= CONFIRM_SAMPLES);
                 _zs.add(z);
                 _spikes.add(spike);
                 if (_zs.size() > GRAPH_POINTS) {
@@ -137,6 +169,14 @@ class LieDetectorView extends WatchUi.View {
             }
         }
         WatchUi.requestUpdate();
+    }
+
+    private function windowMean() as Float {
+        var s = 0.0;
+        for (var i = 0; i < _rr.size(); i++) {
+            s += _rr[i];
+        }
+        return s / _rr.size();
     }
 
     private function rmssd() as Float? {
@@ -169,23 +209,50 @@ class LieDetectorView extends WatchUi.View {
             dc.drawText(w / 2, h * 0.5, Graphics.FONT_SMALL,
                 WatchUi.loadResource(Rez.Strings.Waiting) as String, c);
         } else if (_state == ST_CALIBRATING) {
-            var pct = _calibElapsed * 100 / CALIB_SECONDS;
-            if (pct > 100) {
-                pct = 100;
-            }
-            dc.setColor(Graphics.COLOR_YELLOW, Graphics.COLOR_TRANSPARENT);
-            dc.drawText(w / 2, h * 0.30, Graphics.FONT_SMALL,
-                WatchUi.loadResource(Rez.Strings.Calibrating) as String, c);
-            dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_TRANSPARENT);
-            dc.drawText(w / 2, h * 0.50, Graphics.FONT_NUMBER_HOT,
-                pct.format("%d") + "%", c);
-            dc.setColor(Graphics.COLOR_LT_GRAY, Graphics.COLOR_TRANSPARENT);
-            dc.drawText(w / 2, h * 0.72, Graphics.FONT_SMALL,
-                WatchUi.loadResource(Rez.Strings.TakeSeat) as String, c);
+            drawCalibration(dc, w, h, c);
         } else {
             drawGraph(dc, w, h);
             drawBanner(dc, w, h, c);
         }
+    }
+
+    private function drawCalibration(dc as Dc, w as Number, h as Number, c as Number) as Void {
+        var pct = _calibElapsed * 100 / CALIB_SECONDS;
+        if (pct > 100) {
+            pct = 100;
+        }
+        dc.setColor(Graphics.COLOR_YELLOW, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(w / 2, h * 0.23, Graphics.FONT_SMALL,
+            WatchUi.loadResource(Rez.Strings.Calibrating) as String, c);
+        dc.setColor(Graphics.COLOR_LT_GRAY, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(w / 2, h * 0.33, Graphics.FONT_TINY,
+            WatchUi.loadResource(Rez.Strings.TakeSeat) as String, c);
+        dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(w / 2, h * 0.45, Graphics.FONT_MEDIUM, pct.format("%d") + "%", c);
+
+        var cy = h * 0.66;
+        var rMax = h * 0.11;
+        var rMin = h * 0.04;
+        var word;
+        if (_calibElapsed < GUIDE_SECONDS) {
+            // Paced breathing guide: circle grows on inhale, shrinks on exhale.
+            var phase = (System.getTimer() - _calibStartMs) % BREATH_CYCLE_MS;
+            var k = (1.0 - Math.cos(2.0 * Math.PI * phase / BREATH_CYCLE_MS)) / 2.0;
+            var r = rMin + (rMax - rMin) * k;
+            dc.setColor(Graphics.COLOR_DK_BLUE, Graphics.COLOR_TRANSPARENT);
+            dc.fillCircle(w / 2, cy, r);
+            dc.setColor(Graphics.COLOR_BLUE, Graphics.COLOR_TRANSPARENT);
+            dc.setPenWidth(3);
+            dc.drawCircle(w / 2, cy, r);
+            dc.setPenWidth(1);
+            word = (phase < BREATH_CYCLE_MS / 2)
+                ? Rez.Strings.BreatheIn : Rez.Strings.BreatheOut;
+        } else {
+            word = Rez.Strings.BreatheNormal;
+        }
+        dc.setColor(Graphics.COLOR_BLUE, Graphics.COLOR_TRANSPARENT);
+        dc.drawText(w / 2, h * 0.88, Graphics.FONT_TINY,
+            WatchUi.loadResource(word) as String, c);
     }
 
     private function drawGraph(dc as Dc, w as Number, h as Number) as Void {
