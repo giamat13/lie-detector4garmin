@@ -1,0 +1,16 @@
+import Toybox.Application;
+import Toybox.Lang;
+import Toybox.WatchUi;
+
+// Everything lives in memory only; nothing is written to storage.
+class LieDetectorApp extends Application.AppBase {
+
+    function initialize() {
+        AppBase.initialize();
+    }
+
+    function getInitialView() as [Views] or [Views, InputDelegates] {
+        var view = new LieDetectorView();
+        return [view, new LieDetectorDelegate()];
+    }
+}
